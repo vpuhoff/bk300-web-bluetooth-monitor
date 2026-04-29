@@ -1,5 +1,14 @@
-import { Activity, Pause, Play, PlugZap, Trash2, Unplug } from 'lucide-react'
-import { useMemo } from 'react'
+import {
+  Activity,
+  ChevronDown,
+  ChevronUp,
+  Pause,
+  Play,
+  PlugZap,
+  Trash2,
+  Unplug,
+} from 'lucide-react'
+import { useMemo, useState } from 'react'
 
 import { VoltageChart } from '@/components/VoltageChart'
 import { Badge } from '@/components/ui/badge'
@@ -20,6 +29,7 @@ function App() {
     samples,
     lastVoltage,
   } = useBk300()
+  const [isLogOpen, setIsLogOpen] = useState(false)
 
   const statusVariant = useMemo(() => {
     switch (status) {
@@ -115,24 +125,45 @@ function App() {
           </CardContent>
         </Card>
 
-        <div className="grid gap-4 lg:grid-cols-2">
-          <Card className="lg:order-2">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base">График</CardTitle>
-              <CardDescription>Окно последних 60 секунд</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <VoltageChart samples={samples} windowSec={60} />
-            </CardContent>
-          </Card>
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">График</CardTitle>
+            <CardDescription>Окно последних 60 секунд</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <VoltageChart samples={samples} windowSec={60} />
+          </CardContent>
+        </Card>
 
-          <Card className="lg:order-1">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base">Журнал протокола</CardTitle>
-              <CardDescription>Последние 1000 строк</CardDescription>
-            </CardHeader>
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <CardTitle className="text-base">Журнал протокола</CardTitle>
+                <CardDescription>Последние 1000 строк</CardDescription>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setIsLogOpen((v) => !v)}
+              >
+                {isLogOpen ? (
+                  <>
+                    <ChevronUp className="h-4 w-4" />
+                    Скрыть
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown className="h-4 w-4" />
+                    Показать
+                  </>
+                )}
+              </Button>
+            </div>
+          </CardHeader>
+          {isLogOpen ? (
             <CardContent>
-              <div className="h-[300px] overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs leading-relaxed">
+              <div className="h-[320px] overflow-auto rounded-md border bg-muted/20 p-3 font-mono text-xs leading-relaxed">
                 {log.length === 0 ? (
                   <div className="text-muted-foreground">Пока пусто</div>
                 ) : (
@@ -140,8 +171,8 @@ function App() {
                 )}
               </div>
             </CardContent>
-          </Card>
-        </div>
+          ) : null}
+        </Card>
       </main>
     </div>
   )
