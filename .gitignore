@@ -1,0 +1,33 @@
+# Keep repo focused: docs + web-monitor only
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Decompile / extracted artifacts (do not commit)
+apk_unzipped/
+extracted/
+jadx_out/
+*.xapk
+*.apk
+
+# Logs / misc
+*.log
+
+# Root-level npm artifacts (do not commit)
+node_modules/
+package.json
+package-lock.json
+
+# Web app (do not commit build artifacts)
+web-monitor/node_modules/
+web-monitor/dist/
+web-monitor/.env*
+web-monitor/.DS_Store
+web-monitor/npm-debug.log*
+web-monitor/yarn-debug.log*
+web-monitor/yarn-error.log*
+web-monitor/pnpm-debug.log*
+
