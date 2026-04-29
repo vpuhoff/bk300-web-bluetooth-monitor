@@ -26,7 +26,8 @@ function App() {
     disconnect,
     clear,
     log,
-    samples,
+    chartPoints,
+    chartSummary,
     lastVoltage,
   } = useBk300()
   const [isLogOpen, setIsLogOpen] = useState(false)
@@ -71,7 +72,7 @@ function App() {
                 </span>
               </div>
               <div className="text-xs text-muted-foreground">
-                N {samples.length.toLocaleString()}
+                N {chartSummary.totalSamples.toLocaleString()}
               </div>
             </div>
           </div>
@@ -128,10 +129,13 @@ function App() {
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-base">График</CardTitle>
-            <CardDescription>Окно последних 60 секунд</CardDescription>
+            <CardDescription>
+              История {chartSummary.retentionHours}ч · подробно {chartSummary.detailedMinutes}м ·
+              агрегация {chartSummary.bucketMinutes}м
+            </CardDescription>
           </CardHeader>
           <CardContent>
-            <VoltageChart samples={samples} windowSec={60} />
+            <VoltageChart points={chartPoints} windowSec={12 * 60 * 60} />
           </CardContent>
         </Card>
 

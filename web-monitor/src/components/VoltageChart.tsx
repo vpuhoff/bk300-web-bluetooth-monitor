@@ -2,34 +2,34 @@ import { useEffect, useMemo, useRef } from 'react'
 import uPlot from 'uplot'
 import 'uplot/dist/uPlot.min.css'
 
-import type { Bk300VoltageSample } from '@/lib/bk300'
+export type VoltagePoint = { atMs: number; volts: number }
 
 type Props = {
-  samples: Bk300VoltageSample[]
+  points: VoltagePoint[]
   windowSec?: number
 }
 
-export function VoltageChart({ samples, windowSec = 60 }: Props) {
+export function VoltageChart({ points, windowSec = 60 }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null)
   const plotRef = useRef<uPlot | null>(null)
 
   const data = useMemo(() => {
-    if (samples.length === 0) return [[], []] as [number[], number[]]
+    if (points.length === 0) return [[], []] as [number[], number[]]
     const now = Date.now()
     const from = now - windowSec * 1000
 
     const xs: number[] = []
     const ys: number[] = []
-    for (let i = samples.length - 1; i >= 0; i--) {
-      const s = samples[i]
-      if (s.atMs < from) break
-      xs.push(s.atMs / 1000) // uPlot uses seconds
-      ys.push(s.volts)
+    for (let i = points.length - 1; i >= 0; i--) {
+      const p = points[i]
+      if (p.atMs < from) break
+      xs.push(p.atMs / 1000) // uPlot uses seconds
+      ys.push(p.volts)
     }
     xs.reverse()
     ys.reverse()
     return [xs, ys] as [number[], number[]]
-  }, [samples, windowSec])
+  }, [points, windowSec])
 
   useEffect(() => {
     const el = rootRef.current

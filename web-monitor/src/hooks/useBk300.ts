@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Bk300Frame, Bk300Status, Bk300VoltageSample } from '@/lib/bk300'
 import { Bk300Client, parseVoltageFrom4b0b } from '@/lib/bk300'
+import type { VoltagePoint } from '@/components/VoltageChart'
 
 type LogLine = {
   atMs: number
@@ -21,13 +22,19 @@ export function useBk300() {
   const [status, setStatus] = useState<Bk300Status>('disconnected')
   const [isPaused, setIsPaused] = useState(false)
   const [lastVoltage, setLastVoltage] = useState<Bk300VoltageSample | null>(null)
-  const [samples, setSamples] = useState<Bk300VoltageSample[]>([])
+  const [detailedSamples, setDetailedSamples] = useState<Bk300VoltageSample[]>([])
+  const [bucketMap, setBucketMap] = useState<Map<number, Bucket>>(() => new Map())
   const [frames, setFrames] = useState<Bk300Frame[]>([])
   const [log, setLog] = useState<LogLine[]>([])
 
   const pollTimer = useRef<number | null>(null)
   const reconnectAttempt = useRef(0)
   const reconnectTimer = useRef<number | null>(null)
+  const totalSamples = useRef(0)
+
+  const retentionMs = 12 * 60 * 60 * 1000 // 12h
+  const detailedMs = 10 * 60 * 1000 // last 10 minutes in full detail
+  const bucketMs = 5 * 60 * 1000 // 5-minute buckets
 
   const appendLog = useCallback((text: string) => {
     setLog((prev) => {
@@ -58,6 +65,42 @@ export function useBk300() {
       }
     }, 1000)
   }, [appendLog, client, isPaused, stopPolling])
+
+  const addVoltageSample = useCallback(
+    (v: Bk300VoltageSample) => {
+      totalSamples.current++
+      const now = Date.now()
+      const minDetailed = now - detailedMs
+      const minRetention = now - retentionMs
+
+      // 1) keep detailed samples for last N minutes
+      setDetailedSamples((prev) => {
+        const next = [...prev, v].filter((s) => s.atMs >= minDetailed)
+        return next
+      })
+
+      // 2) aggregate into 5-minute buckets for retention period
+      const bucketStart = Math.floor(v.atMs / bucketMs) * bucketMs
+      setBucketMap((prev) => {
+        const next = new Map(prev)
+        const cur = next.get(bucketStart)
+        if (cur) {
+          cur.sumRaw += v.raw
+          cur.count += 1
+          cur.lastAtMs = v.atMs
+        } else {
+          next.set(bucketStart, { sumRaw: v.raw, count: 1, lastAtMs: v.atMs })
+        }
+
+        // prune old buckets
+        for (const key of next.keys()) {
+          if (key < minRetention - bucketMs) next.delete(key)
+        }
+        return next
+      })
+    },
+    [bucketMs, detailedMs, retentionMs],
+  )
 
   const teardown = useCallback(async () => {
     stopPolling()
@@ -129,12 +172,7 @@ export function useBk300() {
               const v = parseVoltageFrom4b0b(f)
               if (v) {
                 setLastVoltage(v)
-                setSamples((prev) => {
-                  const next = [...prev, v]
-                  // keep last 10k samples
-                  if (next.length > 10_000) return next.slice(next.length - 10_000)
-                  return next
-                })
+                addVoltageSample(v)
               }
             }
           }
@@ -164,9 +202,11 @@ export function useBk300() {
 
   const clear = useCallback(() => {
     setLog([])
-    setSamples([])
+    setDetailedSamples([])
+    setBucketMap(new Map())
     setFrames([])
     setLastVoltage(null)
+    totalSamples.current = 0
   }, [])
 
   useEffect(() => {
@@ -188,6 +228,29 @@ export function useBk300() {
     }
   }, [status])
 
+  const chartPoints = useMemo<VoltagePoint[]>(() => {
+    const now = Date.now()
+    const cutoffDetail = now - detailedMs
+    const cutoffRetention = now - retentionMs
+
+    // buckets older than detailed window
+    const bucketPoints: VoltagePoint[] = []
+    for (const [start, b] of bucketMap.entries()) {
+      if (start < cutoffRetention) continue
+      if (start >= cutoffDetail) continue
+      bucketPoints.push({ atMs: start, volts: (b.sumRaw / b.count) / 100 })
+    }
+    bucketPoints.sort((a, b) => a.atMs - b.atMs)
+
+    const detailPoints: VoltagePoint[] = detailedSamples.map((s) => ({
+      atMs: s.atMs,
+      volts: s.volts,
+    }))
+    detailPoints.sort((a, b) => a.atMs - b.atMs)
+
+    return [...bucketPoints, ...detailPoints]
+  }, [bucketMap, detailedMs, detailedSamples, retentionMs])
+
   return {
     status,
     statusLabel,
@@ -197,11 +260,21 @@ export function useBk300() {
     disconnect: teardown,
     clear,
     log: log.map((l) => `${fmtTime(l.atMs)} ${l.text}`),
-    samples,
+    chartPoints,
+    chartSummary: {
+      retentionHours: Math.round(retentionMs / (60 * 60 * 1000)),
+      detailedMinutes: Math.round(detailedMs / (60 * 1000)),
+      bucketMinutes: Math.round(bucketMs / (60 * 1000)),
+      totalSamples: totalSamples.current,
+      bucketCount: bucketMap.size,
+      detailedCount: detailedSamples.length,
+    },
     lastVoltage,
     frames,
   }
 }
+
+type Bucket = { sumRaw: number; count: number; lastAtMs: number }
 
 function toHexSpaced(bytes: Uint8Array) {
   return Array.from(bytes)
