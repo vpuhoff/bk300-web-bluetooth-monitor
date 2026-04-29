@@ -31,3 +31,6 @@ web-monitor/yarn-debug.log*
 web-monitor/yarn-error.log*
 web-monitor/pnpm-debug.log*
 
+# Root screenshot (documented in README)
+!screenshot.png
+
