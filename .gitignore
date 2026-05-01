@@ -16,6 +16,10 @@ jadx_out/
 # Logs / misc
 *.log
 
+# Python caches (tools/analyze_btsnoop.py etc.)
+__pycache__/
+*.pyc
+
 # Root-level npm artifacts (do not commit)
 node_modules/
 package.json

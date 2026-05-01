@@ -1,0 +1,50 @@
+# Базовые умолчания для проекта bk300_monitor (ESP-IDF, любой чип с BLE).
+# При первом `idf.py reconfigure` они кладутся в sdkconfig. Менять можно через `idf.py menuconfig`.
+
+# Включаем BT/BLE и Bluedroid (тот же стек, что у Android в HCI-логе).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=n
+
+# Нам нужен только GATT-Client; сервер выключаем чтобы экономить flash/heap.
+CONFIG_BT_GATTC_ENABLE=y
+CONFIG_BT_GATTS_ENABLE=n
+CONFIG_BT_BLE_SMP_ENABLE=n
+
+# В IDF 5.3+ legacy-API (esp_ble_gap_set_scan_params / start_scanning / esp_ble_gattc_open)
+# спрятаны под флагом BT 4.2-features. Без него линкер ругается «undefined reference».
+# Extended-сканирование 5.0 нам не нужно (Android в HCI тоже использовал legacy).
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
+CONFIG_BT_BLE_FEAT_PERIODIC_ADV_ENH=n
+CONFIG_BT_BLE_FEAT_PERIODIC_ADV_SYNC_TRANSFER=n
+
+# Для классического ESP32 (Xtensa, dual-core) BTDM-контроллер должен быть в BLE-only режиме.
+# На S3/C3/C6/H2 этой опции нет — Kconfig её просто игнорирует (BLE-only там умолчание).
+CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
+CONFIG_BTDM_CTRL_MODE_BTDM=n
+
+# Логи. По умолчанию ESP_LOG отдаёт INFO — это нас устраивает.
+# Но MAXIMUM_LEVEL=DEBUG нужен, чтобы DEBUG-вызовы НЕ вырезались компилятором
+# (LOG_LOCAL_LEVEL ограничивается этим значением). Без него HCI/BTM трассы
+# Bluedroid вообще не попадают в бинарь, даже если включены ниже.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# HCI-trace в логе (DEBUG-уровень для bt_hci) — увидим LE Connection Update,
+# Number Of Completed Packets, LE Meta события на низком уровне. Если что-то
+# приходит на radio-уровне — увидим тут даже когда GATT не вызывает callback.
+# В runtime включаем выборочно через esp_log_level_set("BT_HCI", ESP_LOG_DEBUG).
+CONFIG_BT_LOG_HCI_TRACE_LEVEL_DEBUG=y
+CONFIG_BT_LOG_BTM_TRACE_LEVEL_WARNING=y
+CONFIG_BT_LOG_GATT_TRACE_LEVEL_WARNING=y
+CONFIG_BT_LOG_L2CAP_TRACE_LEVEL_WARNING=y
+
+# Главный таск настроен на достаточный стек — BLE-callbacks делают много работы.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Чтобы влез весь Bluedroid образ — берём огромный partition (без OTA).
+CONFIG_PARTITION_TABLE_CUSTOM=n
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

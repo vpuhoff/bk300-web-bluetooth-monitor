@@ -1,0 +1,784 @@
+/**
+ * BK300 voltage monitor (ESP32, Arduino, NimBLE-Arduino).
+ *
+ * Flow:
+ * - Scan for BK300 (service FFF0 or name BK300)
+ * - Connect, enable notifications on FFF1
+ * - Kick sequence: 0301 -> 0204 -> 0100
+ * - Send 0B0B periodically, parse 4B0B voltage (U16LE/100); RX кадры с префиксом 24 24 или 40 40
+ * - Cache MAC (+ BLE address type) in Preferences to reconnect without scanning
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <NimBLEDevice.h>
+#include <Preferences.h>
+#include <string>
+
+// Must appear before any function that mentions Bk300Frame: Arduino IDE injects prototypes
+// right after #includes, so bk300PopFrame(Bk300Frame*, ...) would otherwise see an unknown type.
+struct Bk300Frame {
+  uint16_t length;
+  uint16_t typeLE;      // bytes [4..5] as u16le
+  const uint8_t* data;  // pointer into tmp buffer
+  const uint8_t* payload;
+  uint16_t payloadLen;
+  bool crcOk;
+};
+
+static const char* PREF_NS = "bk300";
+static const char* PREF_KEY_MAC = "mac";
+static const char* PREF_KEY_MAC_TYPE = "mac_type"; // ble_addr_t.type (see NimBLEAdvertisedDevice::getAddressType)
+// BK300 может редко/фрагментированно отдавать имя и UUID (adv → scan response); держим окно подлиннее.
+// Важно: NimBLEScan::start(duration, ...) принимает duration в миллисекундах, не секундах.
+static const uint32_t SCAN_DURATION_MS = 15000;
+static const uint32_t POLL_MS = 1000;
+
+// BK300 GATT UUIDs (from web-monitor implementation)
+static NimBLEUUID SERVICE_UUID("0000fff0-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID NOTIFY_UUID("0000fff1-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID WRITE_UUID("0000fff2-0000-1000-8000-00805f9b34fb");
+
+// CRC-16/PPP (CRC-16/X25 reflected), poly=0x8408, init=0xFFFF, xorout=0xFFFF.
+static uint16_t crc16ppp(const uint8_t* data, size_t len) {
+  uint16_t fcs = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    fcs ^= data[i];
+    for (int b = 0; b < 8; b++) {
+      if (fcs & 0x0001) fcs = (fcs >> 1) ^ 0x8408;
+      else fcs >>= 1;
+    }
+  }
+  return (uint16_t)(fcs ^ 0xFFFF);
+}
+
+static size_t buildFrame(uint8_t* out,
+                         size_t outCap,
+                         uint16_t cmdLE /* bytes [4..5] */,
+                         const uint8_t* payload,
+                         size_t payloadLen) {
+  // prefix(2) + len(2) + cmd(2) + payload + crc(2) + 0D0A(2)
+  const uint16_t length = (uint16_t)(payloadLen + 10);
+  if (outCap < length) return 0;
+  out[0] = 0x40;
+  out[1] = 0x40;
+  out[2] = (uint8_t)(length & 0xFF);
+  out[3] = (uint8_t)((length >> 8) & 0xFF);
+  out[4] = (uint8_t)(cmdLE & 0xFF);
+  out[5] = (uint8_t)((cmdLE >> 8) & 0xFF);
+  for (size_t i = 0; i < payloadLen; i++) out[6 + i] = payload[i];
+
+  const uint16_t crc = crc16ppp(out, length - 4);
+  out[length - 4] = (uint8_t)(crc & 0xFF);
+  out[length - 3] = (uint8_t)((crc >> 8) & 0xFF);
+  out[length - 2] = 0x0D;
+  out[length - 1] = 0x0A;
+  return length;
+}
+
+// 0301 frame is hard-coded in the Android app; mirrored by web-monitor:
+// 40 40 0A 00 03 01 33 D3 0D 0A
+static const uint8_t FRAME_0301[] = {0x40, 0x40, 0x0A, 0x00, 0x03, 0x01, 0x33, 0xD3, 0x0D, 0x0A};
+
+// RX buffer, split by 0D0A terminator (like the web app)
+static uint8_t rxBuf[256];
+static size_t rxLen = 0;
+
+// ---- Debug counters (for Serial наблюдения) ----
+static uint32_t c_notifyPackets = 0;
+static uint32_t c_notifyBytes = 0;
+static uint32_t c_rxOverflows = 0;
+static uint32_t c_framesTotal = 0;
+static uint32_t c_framesBadCrc = 0;
+static uint32_t c_frames4b0b = 0;
+static uint32_t c_connectOk = 0;
+static uint32_t c_connectFail = 0;
+static uint32_t c_scanRuns = 0;
+static uint32_t c_scanFound = 0;
+static uint32_t c_scanBleReports = 0; // событий от BLE за один проход скана (диагностика «пустого эфира»)
+static uint32_t c_pollWriteFail = 0;
+static uint32_t c_gattReadFFF1 = 0; // успешных Read FFF1 (fallback если notify/CCCD «молчит»)
+static uint32_t c_rdAttempts = 0;   // сколько раз вызывали read FFF1 (диагностика «fff1_rd=0»)
+static bool dbgPrinted0b0bHex = false;
+static uint32_t c_disconnects = 0;
+static uint32_t lastStatsMs = 0;
+static const uint32_t STATS_EVERY_MS = 5000;
+
+static void rxAppend(const uint8_t* data, size_t len) {
+  if (len == 0) return;
+  if (rxLen + len > sizeof(rxBuf)) {
+    // If we overflow, drop buffer (best-effort like the original app).
+    rxLen = 0;
+    c_rxOverflows++;
+  }
+  memcpy(rxBuf + rxLen, data, len);
+  rxLen += len;
+}
+
+static int findTerminator() {
+  for (size_t i = 0; i + 1 < rxLen; i++) {
+    if (rxBuf[i] == 0x0D && rxBuf[i + 1] == 0x0A) return (int)i;
+  }
+  return -1;
+}
+
+// NOTE: avoid C++ reference parameters here — Arduino's .ino prototype generator can choke on them
+// and produce bizarre follow-on errors (e.g. types "not declared") in some toolchain combos.
+static bool bk300PopFrame(Bk300Frame* outFrame, uint8_t* tmp, size_t tmpCap, size_t* tmpLenOut) {
+  if (!outFrame || !tmp || !tmpLenOut) return false;
+  int termIdx = findTerminator();
+  if (termIdx < 0) return false;
+  size_t frameLen = (size_t)termIdx + 2;
+
+  // Remove candidate from rx first (matches web behavior: drop junk frames)
+  if (frameLen > rxLen) return false;
+  if (frameLen > tmpCap) {
+    memmove(rxBuf, rxBuf + frameLen, rxLen - frameLen);
+    rxLen -= frameLen;
+    return false;
+  }
+
+  memcpy(tmp, rxBuf, frameLen);
+  *tmpLenOut = frameLen;
+  memmove(rxBuf, rxBuf + frameLen, rxLen - frameLen);
+  rxLen -= frameLen;
+
+  if (frameLen < 10) return false;
+  // Команды (TX) — префикс 40 40; ответы в notify с BK300 — 24 24 (как в web-monitor popFrames).
+  const bool ok4040 = (tmp[0] == 0x40 && tmp[1] == 0x40);
+  const bool ok2424 = (tmp[0] == 0x24 && tmp[1] == 0x24);
+  if (!ok4040 && !ok2424) return false;
+
+  uint16_t length = (uint16_t)(tmp[2] | (tmp[3] << 8));
+  if (length != frameLen) return false;
+
+  uint16_t typeLE = (uint16_t)(tmp[4] | (tmp[5] << 8));
+  uint16_t payloadLen = (uint16_t)(length - 10);
+  const uint8_t* payload = tmp + 6;
+
+  uint16_t crcIn = (uint16_t)(tmp[length - 4] | (tmp[length - 3] << 8));
+  uint16_t crcCalc = crc16ppp(tmp, length - 4);
+
+  outFrame->length = length;
+  outFrame->typeLE = typeLE;
+  outFrame->data = tmp;
+  outFrame->payload = payload;
+  outFrame->payloadLen = payloadLen;
+  outFrame->crcOk = (crcIn == crcCalc);
+  return true;
+}
+
+static bool advertisesBk300Service(const NimBLEAdvertisedDevice* dev) {
+  if (!dev) return false;
+  if (dev->isAdvertisingService(SERVICE_UUID)) return true;
+  const uint8_t n = dev->getServiceUUIDCount();
+  for (uint8_t i = 0; i < n; i++) {
+    if (dev->getServiceUUID(i) == SERVICE_UUID) return true;
+  }
+  return false;
+}
+
+// Сравнение без учёта регистра / пробелов (на случай отличий прошивки донгла).
+static bool nameIsBk300(const NimBLEAdvertisedDevice* dev) {
+  if (!dev || !dev->haveName()) return false;
+  String s(dev->getName().c_str());
+  s.trim();
+  s.toLowerCase();
+  if (s.length() == 0) return false;
+  return s == "bk300" || s.startsWith("bk300");
+}
+
+static Preferences prefs;
+
+// Успешный HCI snoop Android показывает FFF2 строго как ATT Write Command (0x52), без Write Request.
+static bool writeFrameBk300NoRsp(NimBLERemoteCharacteristic* w,
+                                 const uint8_t* data,
+                                 size_t len,
+                                 const char* dbgTag) {
+  if (!w || len == 0) return false;
+  bool ok = w->canWriteNoResponse() && w->writeValue((uint8_t*)data, len, false);
+  yield();
+  delay(5);
+
+  NimBLEClient* cl = w->getClient();
+  if (cl && cl->getLastError() != 0) {
+    static uint32_t lastErrLogMs = 0;
+    const uint32_t ms = millis();
+    if (ms - lastErrLogMs > 8000) {
+      lastErrLogMs = ms;
+      Serial.print("FFF2 ATT lastErr=");
+      Serial.print(cl->getLastError());
+      Serial.print(" ");
+      Serial.println(dbgTag ? dbgTag : "");
+    }
+  }
+  return ok;
+}
+
+// Колбэк не через lambda — стабильнее для Arduino IDE и одинаково для notify/indicate.
+static void bk300NotifyCb(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+  c_notifyPackets++;
+  c_notifyBytes += (uint32_t)len;
+  rxAppend(data, len);
+}
+
+static bool bk300CccdNotifyEnabled(const NimBLEAttValue& cfg) {
+  return cfg.length() >= 1 && (cfg.data()[0] & 0x01) != 0;
+}
+
+static void bk300PrintAttHex(const char* label, const NimBLEAttValue& cfg) {
+  Serial.print(label);
+  if (cfg.length() == 0) {
+    Serial.println("(empty)");
+    return;
+  }
+  for (uint16_t i = 0; i < cfg.length(); i++) {
+    if (i) Serial.print(" ");
+    uint8_t b = cfg.data()[i];
+    if (b < 16) Serial.print("0");
+    Serial.print(b, HEX);
+  }
+  Serial.println();
+}
+
+// Явная запись CCCD (0x2902): subscribe() у NimBLE иногда не ставит 01 00 на BK300.
+static bool bk300ForceEnableNotifyCccd(NimBLERemoteDescriptor* d) {
+  static const uint8_t kNotifyLe[] = {0x01, 0x00};
+  for (int pass = 0; pass < 2; pass++) {
+    const bool useRsp = (pass != 0);
+    Serial.print("CCCD explicit ");
+    Serial.println(useRsp ? "Write Request" : "Write Command");
+    if (!d->writeValue(kNotifyLe, sizeof(kNotifyLe), useRsp)) {
+      Serial.println("CCCD write rejected by stack.");
+      continue;
+    }
+    delay(120);
+    NimBLEAttValue cfg = d->readValue();
+    bk300PrintAttHex("CCCD read back: ", cfg);
+    if (bk300CccdNotifyEnabled(cfg)) return true;
+  }
+  return false;
+}
+
+// Часть прошивок некорректно отражает CCCD при Read, но принимает запись; пробуем все допустимые биты.
+static void bk300BlastCccdPatterns(NimBLERemoteDescriptor* d) {
+  static const uint8_t pats[][2] = {{0x01, 0x00}, {0x02, 0x00}, {0x03, 0x00}};
+  Serial.println("CCCD blast: 01/02/03 LE (notify/indicate/both) cmd+req…");
+  for (size_t i = 0; i < 3; i++) {
+    for (int pass = 0; pass < 2; pass++) {
+      if (!d->writeValue(pats[i], 2, pass != 0)) continue;
+      delay(35);
+    }
+    delay(50);
+  }
+}
+
+static bool pollVoltage0b0b(NimBLERemoteCharacteristic* w, const char* tag) {
+  if (!w) return false;
+  uint8_t frame[64];
+  const uint16_t cmdLE = (uint16_t)(0x0B | (0x0B << 8));
+  size_t len = buildFrame(frame, sizeof(frame), cmdLE, nullptr, 0);
+  if (len == 0) return false;
+  if (writeFrameBk300NoRsp(w, frame, len, tag)) return true;
+  c_pollWriteFail++;
+  Serial.print("0B0B write failed ");
+  Serial.println(tag);
+  return false;
+}
+
+// Однократно: сверка кадра 0B0B с веб-логом (40 40 0a 00 0b 0b a9 b2 0d 0a).
+static void dbgPrintBuilt0b0bOnce() {
+  if (dbgPrinted0b0bHex) return;
+  uint8_t f[32];
+  const uint16_t cmdLE = (uint16_t)(0x0B | (0x0B << 8));
+  size_t n = buildFrame(f, sizeof(f), cmdLE, nullptr, 0);
+  Serial.print("CHK 0B0B frame ");
+  for (size_t i = 0; i < n; i++) {
+    if (i) Serial.print(" ");
+    if (f[i] < 16) Serial.print("0");
+    Serial.print(f[i], HEX);
+  }
+  Serial.println();
+  dbgPrinted0b0bHex = true;
+}
+
+static bool writeCmdBytes(NimBLERemoteCharacteristic* w, uint8_t b0, uint8_t b1) {
+  uint8_t frame[64];
+  uint16_t cmdLE = (uint16_t)(b0 | (b1 << 8));
+  size_t len = buildFrame(frame, sizeof(frame), cmdLE, nullptr, 0);
+  if (len == 0) return false;
+  return writeFrameBk300NoRsp(w, frame, len, "writeCmdBytes");
+}
+
+static bool writeCmdPayload(NimBLERemoteCharacteristic* w,
+                            uint8_t b0,
+                            uint8_t b1,
+                            const uint8_t* payload,
+                            size_t payloadLen,
+                            const char* tag) {
+  uint8_t frame[64];
+  uint16_t cmdLE = (uint16_t)(b0 | (b1 << 8));
+  size_t len = buildFrame(frame, sizeof(frame), cmdLE, payload, payloadLen);
+  if (len == 0) return false;
+  return writeFrameBk300NoRsp(w, frame, len, tag);
+}
+
+// ---- Long-running monitor state ----
+static NimBLEClient* client = nullptr;
+static NimBLERemoteCharacteristic* notifyChr = nullptr;
+static NimBLERemoteCharacteristic* writeChr = nullptr;
+static bool kickDone = false;
+static uint32_t lastPollMs = 0;
+static uint32_t reconnectAttempt = 0;
+static uint32_t nextReconnectAtMs = 0;
+
+// После 0B0B fallback: Read FFF1. В веб-приложении этого нет — там только notifications.
+// У многих донглов в GATT нет READ property на FFF1, тогда NimBLE может показывать canRead=0 —
+// всё равно пробуем readValue(): часть прошивок отдаёт кадр по Read только так.
+static void bk300AppendFFF1Read() {
+  if (!notifyChr || !client || !client->isConnected()) return;
+  // BK300 FFF1 имеет только NOTIFY (rd_prop=0). ATT Read Request на такую характеристику возвращает
+  // "Read Not Permitted" и спам-чтение пугает прошивку BK300 (наблюдалось как тишина в эфире).
+  if (!notifyChr->canRead()) return;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt != 0) delay(45);
+    c_rdAttempts++;
+    NimBLEAttValue rv = notifyChr->readValue();
+    if (rv.length() == 0) continue;
+    c_gattReadFFF1++;
+    rxAppend(rv.data(), rv.length());
+    return;
+  }
+}
+
+class ClientCallbacks : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient*) override { Serial.println("Connected."); }
+  void onDisconnect(NimBLEClient*, int reason) override {
+    Serial.print("Disconnected, reason=");
+    Serial.println(reason);
+    c_disconnects++;
+    notifyChr = nullptr;
+    writeChr = nullptr;
+    kickDone = false;
+    lastPollMs = 0;
+    rxLen = 0;
+    c_rdAttempts = 0;
+    c_gattReadFFF1 = 0;
+    dbgPrinted0b0bHex = false;
+
+    // schedule reconnect (exponential backoff up to 30s)
+    const uint32_t delayMs = min<uint32_t>(30000, 1000U * (1U << min<uint32_t>(reconnectAttempt, 5)));
+    reconnectAttempt++;
+    nextReconnectAtMs = millis() + delayMs;
+    Serial.print("Reconnect in ");
+    Serial.print(delayMs);
+    Serial.println(" ms");
+  }
+};
+
+static ClientCallbacks clientCallbacks;
+
+static const NimBLEAdvertisedDevice* scanForBk300() {
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  // Имя и UUID часто дополняются во scan response — нужен активный скан и время ожидания.
+  // Важно: NimBLEScan::start() только ставит скан в очередь и сразу возвращается; нужен getResults().
+  scan->setDuplicateFilter(0);
+  scan->setInterval(100);
+  scan->setWindow(99);
+  scan->setActiveScan(true);
+  // maxResults==0 стирает записи и неудобен для разбора после скана; 0xFF — хранить до следующего скана.
+  scan->setMaxResults(0xFF);
+
+  c_scanBleReports = 0;
+  c_scanRuns++;
+  Serial.println("Scanning for BK300...");
+  const uint32_t tScan0 = millis();
+  NimBLEScanResults results = scan->getResults(SCAN_DURATION_MS, false);
+  const uint32_t scanElapsed = millis() - tScan0;
+  Serial.print("Scan finished in ");
+  Serial.print(scanElapsed);
+  Serial.println(" ms");
+
+  c_scanBleReports = (uint32_t)results.getCount();
+
+  for (int i = 0; i < results.getCount(); i++) {
+    const NimBLEAdvertisedDevice* dev = results.getDevice((uint32_t)i);
+    if (advertisesBk300Service(dev) || nameIsBk300(dev)) {
+      c_scanFound++;
+      return dev;
+    }
+  }
+  return nullptr;
+}
+
+static bool ensureConnected() {
+  if (!client) return false;
+  if (client->isConnected()) return true;
+  if (millis() < nextReconnectAtMs) return false;
+
+  // 1) try cached MAC first
+  String cachedMac = prefs.getString(PREF_KEY_MAC, "");
+  const uint8_t cachedType = prefs.getUChar(PREF_KEY_MAC_TYPE, 0xFF);
+  if (cachedMac.length() > 0) {
+    Serial.print("Trying cached MAC: ");
+    Serial.println(cachedMac);
+    bool ok = false;
+    const uint32_t t0 = millis();
+
+    // Prefer stored address type (required by NimBLEAddress(string, type) in 2.5.0)
+    if (cachedType != 0xFF) {
+      NimBLEAddress addr(std::string(cachedMac.c_str()), cachedType);
+      ok = client->connect(addr);
+    } else {
+      // Migration / best-effort if older prefs didn't store type
+      NimBLEAddress addrRand(std::string(cachedMac.c_str()), BLE_ADDR_RANDOM);
+      ok = client->connect(addrRand);
+      if (!ok) {
+        NimBLEAddress addrPub(std::string(cachedMac.c_str()), BLE_ADDR_PUBLIC);
+        ok = client->connect(addrPub);
+      }
+    }
+
+    if (ok) {
+      c_connectOk++;
+      reconnectAttempt = 0;
+      return true;
+    }
+    c_connectFail++;
+    Serial.print("Cached MAC connect failed (");
+    Serial.print(millis() - t0);
+    Serial.println(" ms)");
+  }
+
+  // 2) scan + connect
+  const NimBLEAdvertisedDevice* dev = scanForBk300();
+  if (!dev) {
+    Serial.println("BK300 not found.");
+    Serial.print("BLE reports this scan: ");
+    Serial.println(c_scanBleReports);
+    if (c_scanBleReports == 0) {
+      Serial.println(
+          "Подсказка: 0 отчётов — помехи/coexistence (Wi‑Fi), антенна или BK300 не в эфире. "
+          "Отключите приложение на телефоне от BK300 на время теста.");
+    }
+    // schedule next try
+    const uint32_t delayMs = min<uint32_t>(30000, 1000U * (1U << min<uint32_t>(reconnectAttempt, 5)));
+    reconnectAttempt++;
+    nextReconnectAtMs = millis() + delayMs;
+    return false;
+  }
+
+  String mac = String(dev->getAddress().toString().c_str());
+  prefs.putString(PREF_KEY_MAC, mac);
+  prefs.putUChar(PREF_KEY_MAC_TYPE, dev->getAddressType());
+  Serial.print("Saved MAC: ");
+  Serial.println(mac);
+  Serial.print("Saved MAC type: ");
+  Serial.println(dev->getAddressType());
+
+  if (!client->connect(dev)) {
+    c_connectFail++;
+    Serial.println("Connect failed after scan.");
+    const uint32_t delayMs = min<uint32_t>(30000, 1000U * (1U << min<uint32_t>(reconnectAttempt, 5)));
+    reconnectAttempt++;
+    nextReconnectAtMs = millis() + delayMs;
+    return false;
+  }
+
+  reconnectAttempt = 0;
+  c_connectOk++;
+  return true;
+}
+
+static bool ensureCharacteristics() {
+  if (!client || !client->isConnected()) return false;
+  if (notifyChr && writeChr) return true;
+
+  const uint32_t t0 = millis();
+
+  // Обмен MTU после connect иногда завершается позже discovery — даём стеку время (как Web Bluetooth).
+  {
+    uint32_t tw = millis();
+    while (client->getMTU() <= 23 && millis() - tw < 2500) {
+      delay(25);
+    }
+    Serial.print("ATT MTU=");
+    Serial.println(client->getMTU());
+  }
+
+  // Без этого: bk300 как веб — connect → service → notify char + write char → startNotifications → kick → опрос.
+  // Web Bluetooth не делает явный secureConnection(); у NimBLE попытка часто висит долго и съедает ~30 с
+  // до первой записи (см. «GATT setup total … ms»).
+
+  // ВАЖНО: НЕ вызываем discoverAttributes(). На некоторых BK300/BK100-прошивках полная ATT-обвязка
+  // с Database Hash / Find Information по всему диапазону переводит линк в состояние, после которого
+  // notify не идут (subscribe возвращает true, CCCD читается как 00 00, нотификаций нет).
+  // Точечный путь как у Web Bluetooth / Android FastBle: только нужный сервис → нужные характеристики.
+  Serial.println("Direct discovery: getService(FFF0) → FFF1/FFF2 (без полного discoverAttributes).");
+
+  NimBLERemoteService* svc = client->getService(SERVICE_UUID);
+  if (!svc) {
+    Serial.println("Service FFF0 not found.");
+    client->disconnect();
+    return false;
+  }
+
+  notifyChr = svc->getCharacteristic(NOTIFY_UUID);
+  writeChr = svc->getCharacteristic(WRITE_UUID);
+  if (!notifyChr || !writeChr) {
+    Serial.println("Chars FFF1/FFF2 not found.");
+    client->disconnect();
+    return false;
+  }
+
+  Serial.print("GATT caps: FFF1 notify=");
+  Serial.print(notifyChr->canNotify());
+  Serial.print(" ind=");
+  Serial.print(notifyChr->canIndicate());
+  Serial.print(" rd_prop=");
+  Serial.print(notifyChr->canRead());
+  Serial.print(" | FFF2 write=");
+  Serial.print(writeChr->canWrite());
+  Serial.print(" norsp=");
+  Serial.println(writeChr->canWriteNoResponse());
+
+  Serial.println("FFF0 characteristic handles (value_hdl):");
+  for (auto it = svc->begin(); it != svc->end(); ++it) {
+    NimBLERemoteCharacteristic* ch = *it;
+    Serial.print(" ");
+    Serial.print(ch->getUUID().toString().c_str());
+    Serial.print(" -> ");
+    Serial.println(ch->getHandle());
+  }
+
+  // NimBLE: если CCCD ещё не открыт, setNotify() возвращает true, но дескриптор не пишет —
+  // колбэк зарегистрирован, notify по эфиру не идут (ловушка «notify=0 при успешном subscribe»).
+  notifyChr->getDescriptors(true);
+  Serial.println("FFF1 descriptors:");
+  for (NimBLERemoteDescriptor* dsc : notifyChr->getDescriptors(false)) {
+    Serial.print(" ");
+    Serial.println(dsc->toString().c_str());
+  }
+  Serial.println(
+      "(0x2902@26 — CCCD; 0x2803 — это Declaration следующей характеристики FFF2, попал в диапазон discovery NimBLE.)");
+  {
+    NimBLERemoteDescriptor* cccd =
+        notifyChr->getDescriptor(NimBLEUUID((uint16_t)0x2902));
+    Serial.print("FFF1 CCCD 0x2902: ");
+    Serial.println(cccd ? "ok" : "MISSING");
+    if (!cccd) {
+      Serial.println("Не удалось найти CCCD — отключение.");
+      client->disconnect();
+      return false;
+    }
+  }
+
+  // 1) Регистрируем колбэк через subscribe(). Здесь нам важна именно регистрация HVN-handler;
+  //    на ряде прошивок NimBLE-Arduino subscribe «как-бы успешен» (true), но фактическую запись
+  //    в CCCD пропускает (или пишет позже). Поэтому ниже всё равно явно пишем 0x01 0x00 в дескриптор.
+  bool subOk = false;
+  if (notifyChr->canNotify()) {
+    subOk = notifyChr->subscribe(true, bk300NotifyCb, false);
+    if (!subOk) subOk = notifyChr->subscribe(true, bk300NotifyCb, true);
+  } else if (notifyChr->canIndicate()) {
+    subOk = notifyChr->subscribe(false, bk300NotifyCb, false);
+    if (!subOk) subOk = notifyChr->subscribe(false, bk300NotifyCb, true);
+  } else {
+    Serial.println("FFF1: нет ни notify, ни indicate — ответы по BLE могут не приходить.");
+  }
+  Serial.print("subscribe() returned: ");
+  Serial.println(subOk ? "true" : "false");
+
+  // 2) Явно пишем CCCD как Write Request 01 00 (как Android: handle 0x0011 ← 01 00).
+  //    Это страховка от случая, когда subscribe() не дошёл до эфира.
+  delay(60);
+  {
+    NimBLERemoteDescriptor* cccdWr =
+        notifyChr->getDescriptor(NimBLEUUID((uint16_t)0x2902));
+    if (!cccdWr) {
+      Serial.println("CCCD lost after subscribe.");
+      client->disconnect();
+      return false;
+    }
+    static const uint8_t kEnableNotifyLE[] = {0x01, 0x00};
+    bool wrOk = cccdWr->writeValue(kEnableNotifyLE, sizeof(kEnableNotifyLE), true);
+    Serial.print("Explicit CCCD Write Request 01 00: ");
+    Serial.println(wrOk ? "ok" : "FAILED");
+    delay(120);
+
+    NimBLEAttValue cfg = cccdWr->readValue();
+    bk300PrintAttHex("CCCD read-back: ", cfg);
+    if (!bk300CccdNotifyEnabled(cfg)) {
+      Serial.println(
+          "Note: read-back=0, но HCI Android тоже не читает CCCD. Если notify=0 — проблема ниже стека.");
+    }
+  }
+
+  Serial.print("GATT setup total ");
+  Serial.print(millis() - t0);
+  Serial.println(" ms (MTU + svc/desc + subscribe/CCCD)");
+
+  return true;
+}
+
+static void ensureKick() {
+  if (!writeChr || kickDone) return;
+  dbgPrintBuilt0b0bOnce();
+  delay(400);
+  Serial.println("Init (Android HCI): 0B06 00 -> 0100 -> 0B01 time -> 0B08 -> 0B0B");
+  // MainActivityNew.notifySuccess(): sendOpenVoltage(0) -> 0B06 00, затем 0100.
+  static const uint8_t openVoltageOff[] = {0x00};
+  writeCmdPayload(writeChr, 0x0B, 0x06, openVoltageOff, sizeof(openVoltageOff), "0B06 00");
+  delay(10);
+  writeCmdBytes(writeChr, 0x01, 0x00);  // 0100
+  delay(700);
+
+  // MainActivityNew.sendGetLastData(): payload = currentTimeMillis()/1000 LE.
+  const uint32_t sec = millis() / 1000;
+  const uint8_t sincePayload[] = {
+      (uint8_t)(sec & 0xFF),
+      (uint8_t)((sec >> 8) & 0xFF),
+      (uint8_t)((sec >> 16) & 0xFF),
+      (uint8_t)((sec >> 24) & 0xFF),
+  };
+  writeCmdPayload(writeChr, 0x0B, 0x01, sincePayload, sizeof(sincePayload), "0B01 time");
+  delay(100);
+  writeCmdBytes(writeChr, 0x0B, 0x08);  // 0B08
+  delay(50);
+  kickDone = true;
+  Serial.println("Poll: 0B0B (initial x2)");
+  pollVoltage0b0b(writeChr, "(initial #1)");
+  delay(100);
+  pollVoltage0b0b(writeChr, "(initial #2)");
+  delay(200);
+  bk300AppendFFF1Read();
+  lastPollMs = millis();
+}
+
+static void drainFrames() {
+  uint8_t tmp[256];
+  size_t tmpLen = 0;
+  Bk300Frame f{};
+
+  while (bk300PopFrame(&f, tmp, sizeof(tmp), &tmpLen)) {
+    c_framesTotal++;
+    if (!f.crcOk) {
+      c_framesBadCrc++;
+      continue;
+    }
+    // 4B 0B => typeLE=0x0B4B
+    if (f.typeLE == 0x0B4B && f.payloadLen >= 2) {
+      c_frames4b0b++;
+      const uint16_t raw = (uint16_t)(f.payload[0] | (f.payload[1] << 8));
+      const float volts = raw / 100.0f;
+      Serial.print("Voltage: ");
+      Serial.println(volts, 2);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  prefs.begin(PREF_NS, false);
+
+  // Wi‑Fi + BLE на одном радио часто «глушат» скан; для отладки BLE централа Wi‑Fi не нужен.
+  WiFi.mode(WIFI_OFF);
+
+  // ESP‑контроллер: при mode 2 повторно шлёт результат, если данные адверта изменились (adv vs scan response).
+  NimBLEDevice::setScanFilterMode(2);
+
+  NimBLEDevice::init("");
+  // Запросить больший ATT MTU (в браузере он типично >23); без этого длинные notify могут не доставляться.
+  NimBLEDevice::setMTU(247);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  // BK300 в HCI Android-логе подключается без SMP/шифрования; принудительно отключаем у себя,
+  // чтобы NimBLE не пытался pairing/encryption и не зависал.
+  NimBLEDevice::setSecurityAuth(false, false, false);
+  // Если когда-либо был bonding (или сохранился старый ключ), периферийник может молчать на CCCD —
+  // проще каждый раз стартовать с чистым keystore.
+  NimBLEDevice::deleteAllBonds();
+
+  client = NimBLEDevice::createClient();
+  client->setClientCallbacks(&clientCallbacks, false);
+  // Интервалы в единицах 1.25 ms; supervision timeout — в 10 ms (BLE max ~32 с).
+  // BK300 чувствителен к слишком короткому интервалу — берём 60..120 ms (как у Android).
+  client->setConnectionParams(48, 96, 0, 500); // ~60–120 ms conn, 5 с supervision
+
+  rxLen = 0;
+  reconnectAttempt = 0;
+  nextReconnectAtMs = 0;
+  lastPollMs = 0;
+  kickDone = false;
+
+  Serial.println("BK300 monitor started (no deep sleep).");
+}
+
+void loop() {
+  // Скан может занять SCAN_DURATION_MS — не обрываем связь «по таймауту» сразу после connect().
+  if (!ensureConnected()) {
+    delay(50);
+    return;
+  }
+
+  if (!ensureCharacteristics()) {
+    delay(50);
+    return;
+  }
+
+  ensureKick();
+
+  // Poll voltage request periodically
+  const uint32_t now = millis();
+  if (now - lastPollMs >= POLL_MS) {
+    lastPollMs = now;
+    if (writeChr) {
+      pollVoltage0b0b(writeChr, "(periodic #1)");
+      delay(100);
+      pollVoltage0b0b(writeChr, "(periodic #2)");
+      delay(150);
+      bk300AppendFFF1Read();
+    }
+  }
+
+  // Drain any received frames and print voltage
+  drainFrames();
+
+  // Periodic stats line (no spam, helps watch reconnect/CRC health)
+  if (now - lastStatsMs >= STATS_EVERY_MS) {
+    lastStatsMs = now;
+    Serial.print("stats: conn_ok=");
+    Serial.print(c_connectOk);
+    Serial.print(" conn_fail=");
+    Serial.print(c_connectFail);
+    Serial.print(" disc=");
+    Serial.print(c_disconnects);
+    Serial.print(" scan=");
+    Serial.print(c_scanRuns);
+    Serial.print("/");
+    Serial.print(c_scanFound);
+    Serial.print(" notify=");
+    Serial.print(c_notifyPackets);
+    Serial.print(" pkts ");
+    Serial.print(c_notifyBytes);
+    Serial.print(" B");
+    Serial.print(" frames=");
+    Serial.print(c_framesTotal);
+    Serial.print(" badcrc=");
+    Serial.print(c_framesBadCrc);
+    Serial.print(" 4b0b=");
+    Serial.print(c_frames4b0b);
+    Serial.print(" poll_wr_fail=");
+    Serial.print(c_pollWriteFail);
+    Serial.print(" rd_at=");
+    Serial.print(c_rdAttempts);
+    Serial.print(" fff1_rd=");
+    Serial.print(c_gattReadFFF1);
+    Serial.print(" rxovf=");
+    Serial.println(c_rxOverflows);
+  }
+
+  delay(10);
+}
+
