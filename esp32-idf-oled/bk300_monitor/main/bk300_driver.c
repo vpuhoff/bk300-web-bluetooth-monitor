@@ -49,6 +49,24 @@ static const char *TAG = "bk300";
 #define BK300_KICK_STALL_NUDGE_US (5 * 1000 * 1000ULL)
 /** Подряд неудач read_rssi (ошибка или r==127) после kick — сброс «зомби» GATT. */
 #define BK300_RSSI_DEAD_LINK_STREAK 4
+/** После хотя бы одного 0B4B: нет новых кадров напряжения — эскалация (нужно, иначе rx «растёт» бесконечно при зомби-линке). */
+#define BK300_VOLTAGE_SILENCE_NUDGE_US (15 * 1000000ULL)
+#define BK300_VOLTAGE_SILENCE_REREG_US (25 * 1000000ULL)
+#define BK300_VOLTAGE_SILENCE_CCCD_US (35 * 1000000ULL)
+#define BK300_VOLTAGE_SILENCE_REKICK_US (50 * 1000000ULL)
+#define BK300_VOLTAGE_SILENCE_DISCONNECT_US (75 * 1000000ULL)
+/** Нет нового 0B4B столько времени — пробуем GATT Read (проверка живого ACL/ATT). */
+#define BK300_RX_STALE_LINK_PROBE_US (30 * 1000000ULL)
+/** Если ответ на probe-read не пришёл — считаем линк мёртвым. */
+#define BK300_LINK_READ_TIMEOUT_US (5 * 1000000ULL)
+/** После удачного read не ддосим слейв: пауза перед следующим probe, пока rx всё ещё stale. */
+#define BK300_LINK_PROBE_COOLDOWN_OK_US (8 * 1000000ULL)
+/** Read прошёл, но телеметрии всё равно нет столько — рвём линк и коннект с нуля. */
+#define BK300_LINK_PROBE_STALE_HARD_DISCONNECT_US (45 * 1000000ULL)
+
+#define BK300_LINK_PROBE_KIND_NONE 0
+#define BK300_LINK_PROBE_KIND_CHAR 1
+#define BK300_LINK_PROBE_KIND_DESCR 2
 
 static esp_bt_uuid_t s_svc_uuid = {
     .len = ESP_UUID_LEN_16,
@@ -113,10 +131,19 @@ typedef struct {
   uint64_t kick_done_us;
   /** После kick получили хотя бы один кадр 0B4B с напряжением. */
   bool saw_voltage_notify;
-  /** Счётчик 5-секундных «stall»-тиков (лёгкий nudge); растёт, пока нет 0B4B. */
+  /** Время последнего валидного кадра 0B4B (esp_timer_get_time), 0 = ещё не было / только kick. */
+  uint64_t last_0b4b_us;
+  /** Номер последней выполненной фазы recovery при тишине 0B4B (1..5), 0 = сброс. */
+  uint8_t voltage_recovery_phase;
+  /** Счётчик 5-секундных «stall»-тиков (лёгкий nudge); растёт, пока нет 0B4B до первого кадра. */
   uint32_t stall_ticks;
   /** Подряд плохих read_rssi при kicked (недоступен слой линка). */
   uint8_t rssi_dead_link_streak;
+
+  /** Зомби-линк: возраст rx > порога — уходит GATT read, ждём колбэк или таймаут. */
+  uint64_t link_probe_sent_us;
+  uint64_t link_probe_cooldown_until_us;
+  uint8_t link_probe_kind;
 
   esp_timer_handle_t poll_timer;
 
@@ -138,6 +165,10 @@ static void bk300_recovery_rewrite_cccd(void);
 static void bk300_recovery_rereg_notify(void);
 static void bk300_kick_repeat_task(void *arg);
 static void bk300_poll_timer_cb(void *arg);
+static void bk300_poll_voltage_silence_recovery(uint64_t now);
+static void bk300_poll_link_read_probe(uint64_t now);
+static void bk300_link_probe_start(uint64_t now);
+static void bk300_post_disconnect_rescan_task(void *arg);
 
 static volatile bool s_rekick_busy;
 
@@ -147,6 +178,9 @@ static void bk300_force_disconnect(const char *reason) {
   ESP_LOGW(TAG, "force disconnect: %s", reason ? reason : "?");
   oled_set_status("Stale link");
   g_ctx.rssi_dead_link_streak = 0;
+  g_ctx.link_probe_sent_us = 0;
+  g_ctx.link_probe_kind = BK300_LINK_PROBE_KIND_NONE;
+  g_ctx.link_probe_cooldown_until_us = 0;
   (void)esp_ble_gattc_close(g_ctx.gattc_if, g_ctx.conn_id);
 }
 
@@ -229,6 +263,12 @@ static void bk300_send_0b0b(const char *tag) {
 
 /** Полная цепочка команд на FFF2 (с задержками). Можно вызывать повторно при recovery. */
 static void bk300_kick_run_body(const char *phase_tag) {
+  /* last_0b4b_us — только момент последнего *реального* 0B4B; при re-kick не сбрасываем,
+   * иначе «тишина» обнуляется и disconnect >=75s от первой потери данных никогда не срабатывает. */
+  if (!g_ctx.saw_voltage_notify) {
+    g_ctx.last_0b4b_us = 0;
+  }
+  g_ctx.voltage_recovery_phase = 0;
   ESP_LOGI(TAG, "kick (%s): 0B06 00 -> 0100 -> 0B01 -> 0B08 -> 0B0B", phase_tag ? phase_tag : "?");
   oled_set_status("Kicking...");
   static const uint8_t open_voltage_off[] = {0x00};
@@ -261,6 +301,9 @@ static void bk300_kick_run_body(const char *phase_tag) {
   g_ctx.kick_done_us = esp_timer_get_time();
   g_ctx.stall_ticks = 0;
   oled_set_status("Wait data");
+
+  // MTU 247 запрашиваем после kick — теперь BK300 активен и не разорвёт линк.
+  esp_ble_gattc_send_mtu_req(g_ctx.gattc_if, g_ctx.conn_id);
 
   esp_timer_create_args_t targs = {
       .callback = bk300_poll_timer_cb,
@@ -305,20 +348,177 @@ static void bk300_kick_repeat_task(void *arg) {
   vTaskDelete(NULL);
 }
 
+/** Не вызывать vTaskDelay из GATTC_DISCONNECT_EVT — блокирует BTC и скан может не стартовать. */
+static void bk300_post_disconnect_rescan_task(void *arg) {
+  uint32_t delay_ms = arg ? (uint32_t)(uintptr_t)arg : 1000;
+  vTaskDelay(pdMS_TO_TICKS(delay_ms));
+  esp_err_t e = esp_ble_gap_start_scanning(SCAN_DURATION_S);
+  if (e != ESP_OK) {
+    ESP_LOGE(TAG, "post-disconnect scan err=%d %s", e, esp_err_to_name(e));
+    vTaskDelay(pdMS_TO_TICKS(400));
+    e = esp_ble_gap_start_scanning(SCAN_DURATION_S);
+    if (e != ESP_OK) {
+      ESP_LOGE(TAG, "post-disconnect scan retry err=%d %s", e, esp_err_to_name(e));
+    }
+  } else {
+    ESP_LOGI(TAG, "post-disconnect scan started");
+  }
+  vTaskDelete(NULL);
+}
+
 static void bk300_poll_stall_nudge(void) {
-  ESP_LOGW(TAG, "no 0B4B after kick: nudge 0100 + 0B0B");
-  bk300_send_cmd_bytes(0x01, 0x00, "stall nudge 0100");
+  if (g_ctx.notify_pkts == 0) {
+    ESP_LOGW(TAG, "no 0B4B after kick: nudge 0100 + 0B0B (no notify)");
+    bk300_send_cmd_bytes(0x01, 0x00, "stall nudge 0100");
+  } else {
+    ESP_LOGW(TAG, "no 0B4B after kick: nudge 0B0B (notify flowing)");
+  }
   bk300_send_0b0b("stall nudge 0B0B");
+}
+
+/** После первого кадра напряжения: только RSSI/0B0B могут «жить», а 0B4B нет — отдельная лестница. */
+static void bk300_poll_voltage_silence_recovery(uint64_t now) {
+  static uint64_t s_last_disc_log_us;
+
+  if (!g_ctx.connected || !g_ctx.kicked || !g_ctx.saw_voltage_notify || g_ctx.last_0b4b_us == 0) {
+    return;
+  }
+
+  uint64_t silence = now - g_ctx.last_0b4b_us;
+
+  /* Не полагаемся на одну попытку: при зомби-линке первый close может не отработать. */
+  if (silence >= BK300_VOLTAGE_SILENCE_DISCONNECT_US) {
+    g_ctx.voltage_recovery_phase = 5;
+    if (s_last_disc_log_us == 0 || (now - s_last_disc_log_us) >= (15 * 1000000ULL)) {
+      s_last_disc_log_us = now;
+      ESP_LOGW(TAG, "0B4B stale %" PRIu32 "s: gattc_close (repeat each poll until link drops)",
+               (uint32_t)(silence / 1000000ULL));
+    }
+    (void)esp_ble_gattc_close(g_ctx.gattc_if, g_ctx.conn_id);
+    return;
+  }
+
+  s_last_disc_log_us = 0;
+
+  uint8_t phase = 0;
+  if (silence >= BK300_VOLTAGE_SILENCE_REKICK_US) {
+    phase = 4;
+  } else if (silence >= BK300_VOLTAGE_SILENCE_CCCD_US) {
+    phase = 3;
+  } else if (silence >= BK300_VOLTAGE_SILENCE_REREG_US) {
+    phase = 2;
+  } else if (silence >= BK300_VOLTAGE_SILENCE_NUDGE_US) {
+    phase = 1;
+  }
+
+  if (phase == 0) {
+    g_ctx.voltage_recovery_phase = 0;
+    return;
+  }
+  if (phase <= g_ctx.voltage_recovery_phase) {
+    return;
+  }
+
+  g_ctx.voltage_recovery_phase = phase;
+
+  switch (phase) {
+  case 1:
+    ESP_LOGW(TAG, "0B4B stale >=15s: nudge 0B0B only (0100 omitted — live link)");
+    bk300_send_0b0b("silence nudge 0B0B");
+    break;
+  case 2:
+    ESP_LOGW(TAG, "0B4B stale >=25s: register_for_notify again");
+    bk300_recovery_rereg_notify();
+    break;
+  case 3:
+    ESP_LOGW(TAG, "0B4B stale >=35s: rewrite CCCD");
+    bk300_recovery_rewrite_cccd();
+    break;
+  case 4:
+    if (!s_rekick_busy) {
+      ESP_LOGW(TAG, "0B4B stale >=50s: full re-kick");
+      s_rekick_busy = true;
+      if (xTaskCreate(bk300_kick_repeat_task, "bk_vrkick", 4608, NULL, 5, NULL) != pdPASS) {
+        s_rekick_busy = false;
+      }
+    }
+    break;
+  default:
+    break;
+  }
+}
+
+/** Если долго нет 0B4B, но RSSI ещё «живой» — GATT Read должен уйти в ATT; при обрыве — ошибка/таймаут → disconnect. */
+static void bk300_link_probe_start(uint64_t now) {
+  if (!g_ctx.connected || g_ctx.gattc_if == ESP_GATT_IF_NONE) return;
+
+  uint16_t handle = 0;
+  bool     descr = false;
+
+  if (g_ctx.notify_char_handle) {
+    handle = g_ctx.notify_char_handle;
+  } else if (g_ctx.write_char_handle) {
+    handle = g_ctx.write_char_handle;
+  } else if (g_ctx.notify_cccd_handle) {
+    handle = g_ctx.notify_cccd_handle;
+    descr = true;
+  } else {
+    bk300_force_disconnect("link probe: no GATT handles");
+    return;
+  }
+
+  g_ctx.link_probe_sent_us = now;
+  g_ctx.link_probe_kind = descr ? (uint8_t)BK300_LINK_PROBE_KIND_DESCR : (uint8_t)BK300_LINK_PROBE_KIND_CHAR;
+
+  esp_err_t e =
+      descr ? esp_ble_gattc_read_char_descr(g_ctx.gattc_if, g_ctx.conn_id, handle, ESP_GATT_AUTH_REQ_NONE)
+            : esp_ble_gattc_read_char(g_ctx.gattc_if, g_ctx.conn_id, handle, ESP_GATT_AUTH_REQ_NONE);
+  if (e != ESP_OK) {
+    ESP_LOGW(TAG, "link probe read init err=%d", (int)e);
+    g_ctx.link_probe_sent_us = 0;
+    g_ctx.link_probe_kind = BK300_LINK_PROBE_KIND_NONE;
+    bk300_force_disconnect("link probe stack rejected read");
+    return;
+  }
+  ESP_LOGI(TAG, "link probe: %s read handle=0x%04X (rx >30s)", descr ? "CCCD" : "char", handle);
+}
+
+static void bk300_poll_link_read_probe(uint64_t now) {
+  if (!g_ctx.connected || !g_ctx.kicked || !g_ctx.saw_voltage_notify || g_ctx.last_0b4b_us == 0) {
+    return;
+  }
+
+  uint64_t rx_age = now - g_ctx.last_0b4b_us;
+  if (rx_age < BK300_RX_STALE_LINK_PROBE_US) {
+    g_ctx.link_probe_sent_us = 0;
+    g_ctx.link_probe_kind = BK300_LINK_PROBE_KIND_NONE;
+    return;
+  }
+
+  if (g_ctx.link_probe_sent_us != 0) {
+    if ((now - g_ctx.link_probe_sent_us) >= BK300_LINK_READ_TIMEOUT_US) {
+      g_ctx.link_probe_sent_us = 0;
+      g_ctx.link_probe_kind = BK300_LINK_PROBE_KIND_NONE;
+      bk300_force_disconnect("link probe read timeout (no GATT callback)");
+    }
+    return;
+  }
+
+  if (now < g_ctx.link_probe_cooldown_until_us) {
+    return;
+  }
+
+  bk300_link_probe_start(now);
 }
 
 static void bk300_poll_timer_cb(void *arg) {
   (void)arg;
   if (!g_ctx.connected) return;
 
-  bool skip_light_nudge = false;
+  uint64_t now = esp_timer_get_time();
+  bool     skip_light_nudge = false;
 
   if (g_ctx.kicked && !g_ctx.saw_voltage_notify && g_ctx.kick_done_us != 0) {
-    uint64_t now = esp_timer_get_time();
     if ((now - g_ctx.kick_done_us) >= BK300_KICK_STALL_NUDGE_US) {
       g_ctx.kick_done_us = now;
       g_ctx.stall_ticks++;
@@ -351,6 +551,10 @@ static void bk300_poll_timer_cb(void *arg) {
     }
   }
 
+  bk300_poll_voltage_silence_recovery(now);
+
+  bk300_poll_link_read_probe(now);
+
   bk300_send_0b0b("0B0B periodic");
   (void)esp_ble_gap_read_rssi(g_ctx.peer_bda);
 }
@@ -371,6 +575,11 @@ static void bk300_drain_frames(void) {
       g_ctx.saw_voltage_notify = true;
       g_ctx.stall_ticks = 0;
       g_ctx.rssi_dead_link_streak = 0;
+      g_ctx.last_0b4b_us = esp_timer_get_time();
+      g_ctx.voltage_recovery_phase = 0;
+      g_ctx.link_probe_sent_us = 0;
+      g_ctx.link_probe_cooldown_until_us = 0;
+      g_ctx.link_probe_kind = BK300_LINK_PROBE_KIND_NONE;
       uint16_t raw = (uint16_t)(f.payload[0] | (f.payload[1] << 8));
       float v = raw / 100.0f;
       ESP_LOGI(TAG, "Voltage: %.2f V", v);
@@ -434,22 +643,36 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
       oled_set_rssi_dbm(OLED_RSSI_NONE);
       oled_set_status("Conn failed");
       g_ctx.connected = false;
-      // restart scan after small backoff
-      vTaskDelay(pdMS_TO_TICKS(1500));
-      ESP_ERROR_CHECK(esp_ble_gap_start_scanning(SCAN_DURATION_S));
+      // 0x3E = CONN_FAILED_ESTABLISHMENT: BK300 не готов после разрыва.
+      // Ждём дольше перед повторным сканом — не блокируем BTC task.
+      uint32_t backoff_ms = (p->open.status == 133) ? 5000 : 1500;
+      if (xTaskCreate(bk300_post_disconnect_rescan_task, "bk_rescan",
+                      3584, (void *)(uintptr_t)backoff_ms, 5, NULL) != pdPASS) {
+        vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+        ESP_ERROR_CHECK(esp_ble_gap_start_scanning(SCAN_DURATION_S));
+      }
       break;
     }
     ESP_LOGI(TAG, "GATTC open ok, conn_id=%d", p->open.conn_id);
     g_ctx.conn_id = p->open.conn_id;
     g_ctx.connected = true;
-    // Просим MTU 247 — как Android.
-    esp_ble_gattc_send_mtu_req(gattc_if, p->open.conn_id);
+    // Если handles уже известны (reconnect к тому же устройству) — пропускаем
+    // service discovery (3+ с) и сразу регистрируем notify. Это критично:
+    // BK300 ставит supervision_timeout=100 (1 s) рано, и discovery не успевает.
+    if (g_ctx.notify_char_handle && g_ctx.write_char_handle &&
+        memcmp(g_ctx.peer_bda, p->open.remote_bda, sizeof(esp_bd_addr_t)) == 0) {
+      ESP_LOGI(TAG, "reconnect: reusing cached handles FFF1=0x%04X FFF2=0x%04X CCCD=0x%04X",
+               g_ctx.notify_char_handle, g_ctx.write_char_handle, g_ctx.notify_cccd_handle);
+      esp_err_t err = esp_ble_gattc_register_for_notify(gattc_if, g_ctx.peer_bda,
+                                                        g_ctx.notify_char_handle);
+      ESP_LOGI(TAG, "register_for_notify (cached), err=%d", err);
+    } else {
+      esp_ble_gattc_search_service(gattc_if, p->open.conn_id, &s_svc_uuid);
+    }
     break;
 
   case ESP_GATTC_CFG_MTU_EVT:
     ESP_LOGI(TAG, "MTU exchanged, status=%d, mtu=%d", p->cfg_mtu.status, p->cfg_mtu.mtu);
-    // Запускаем поиск только нашего сервиса FFF0.
-    esp_ble_gattc_search_service(gattc_if, p->cfg_mtu.conn_id, &s_svc_uuid);
     break;
 
   case ESP_GATTC_SEARCH_RES_EVT:
@@ -524,13 +747,22 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
     }
     ESP_LOGI(TAG, "register_for_notify ok, handle=0x%04X", p->reg_for_notify.handle);
     g_ctx.notify_registered = true;
-    // Страховочно сами тоже пишем CCCD 01 00 (Write Request) — на случай если стек не успел.
+    // Bluedroid может не послать WRITE_DESCR_EVT если CCCD закеширован.
+    // Всегда пишем CCCD явно сами — гарантируем что BK300 его получит.
     if (g_ctx.notify_cccd_handle) {
       uint8_t cccd_val[2] = {0x01, 0x00};
       esp_err_t err = esp_ble_gattc_write_char_descr(
           gattc_if, g_ctx.conn_id, g_ctx.notify_cccd_handle, sizeof(cccd_val), cccd_val,
           ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
       ESP_LOGI(TAG, "explicit CCCD write_descr, err=%d", err);
+      if (err != ESP_OK && !g_ctx.kicked) {
+        // write_descr не запустился — шлём kick напрямую
+        vTaskDelay(pdMS_TO_TICKS(250));
+        bk300_send_kick_sequence();
+      }
+    } else if (!g_ctx.kicked) {
+      vTaskDelay(pdMS_TO_TICKS(250));
+      bk300_send_kick_sequence();
     }
     break;
   }
@@ -539,9 +771,6 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
     ESP_LOGI(TAG, "write_descr complete, status=%d handle=0x%04X",
              p->write.status, p->write.handle);
     if (p->write.status == ESP_GATT_OK && !g_ctx.kicked) {
-      // Android ждёт ~226 ms между Write Response (CCCD) и первым 0B06.
-      // Возможно, BK300-прошивке нужна эта пауза, чтобы внутри активировать
-      // notification subscription.
       vTaskDelay(pdMS_TO_TICKS(250));
       bk300_send_kick_sequence();
     }
@@ -568,11 +797,45 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
     break;
 
   case ESP_GATTC_READ_CHAR_EVT:
+    if (g_ctx.link_probe_sent_us != 0 && g_ctx.link_probe_kind == BK300_LINK_PROBE_KIND_CHAR) {
+      g_ctx.link_probe_sent_us = 0;
+      g_ctx.link_probe_kind = BK300_LINK_PROBE_KIND_NONE;
+      if (p->read.status != ESP_GATT_OK) {
+        ESP_LOGW(TAG, "link probe READ_CHAR status=%d", (int)p->read.status);
+        bk300_force_disconnect("link probe READ_CHAR failed");
+      } else {
+        uint64_t t = esp_timer_get_time();
+        if ((t - g_ctx.last_0b4b_us) >= BK300_LINK_PROBE_STALE_HARD_DISCONNECT_US) {
+          bk300_force_disconnect("READ_CHAR ok but 0B4B stale — full resync");
+        } else {
+          g_ctx.link_probe_cooldown_until_us = t + BK300_LINK_PROBE_COOLDOWN_OK_US;
+          ESP_LOGI(TAG, "link probe READ_CHAR ok len=%d", p->read.value_len);
+        }
+      }
+      break;
+    }
     ESP_LOGI(TAG, "read_char status=%d handle=0x%04X len=%d",
              p->read.status, p->read.handle, p->read.value_len);
     break;
 
   case ESP_GATTC_READ_DESCR_EVT:
+    if (g_ctx.link_probe_sent_us != 0 && g_ctx.link_probe_kind == BK300_LINK_PROBE_KIND_DESCR) {
+      g_ctx.link_probe_sent_us = 0;
+      g_ctx.link_probe_kind = BK300_LINK_PROBE_KIND_NONE;
+      if (p->read.status != ESP_GATT_OK) {
+        ESP_LOGW(TAG, "link probe READ_DESCR status=%d", (int)p->read.status);
+        bk300_force_disconnect("link probe CCCD read failed");
+      } else {
+        uint64_t t = esp_timer_get_time();
+        if ((t - g_ctx.last_0b4b_us) >= BK300_LINK_PROBE_STALE_HARD_DISCONNECT_US) {
+          bk300_force_disconnect("READ_DESCR ok but 0B4B stale — full resync");
+        } else {
+          g_ctx.link_probe_cooldown_until_us = t + BK300_LINK_PROBE_COOLDOWN_OK_US;
+          ESP_LOGI(TAG, "link probe READ_DESCR ok len=%d", p->read.value_len);
+        }
+      }
+      break;
+    }
     ESP_LOGI(TAG, "read_descr status=%d handle=0x%04X len=%d",
              p->read.status, p->read.handle, p->read.value_len);
     if (p->read.value_len >= 2) {
@@ -588,23 +851,40 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
     ESP_LOGI(TAG, "DIS_SRVC_CMPL");
     break;
 
-  case ESP_GATTC_DISCONNECT_EVT:
-    ESP_LOGW(TAG, "Disconnected, reason=0x%02X", p->disconnect.reason);
+  case ESP_GATTC_DISCONNECT_EVT: {
+    uint16_t dc = p->disconnect.conn_id;
+    ESP_LOGW(TAG, "Disconnected, reason=0x%02X conn_id=%u", (unsigned)p->disconnect.reason, (unsigned)dc);
+    if (!g_ctx.connected || dc != g_ctx.conn_id) {
+      ESP_LOGW(TAG, "DISCONNECT_EVT ignored (connected=%d evt_cid=%u ctx_cid=%u)", (int)g_ctx.connected,
+               (unsigned)dc, (unsigned)g_ctx.conn_id);
+      break;
+    }
+
     oled_set_rssi_dbm(OLED_RSSI_NONE);
+    oled_set_voltage(-1.0f);
     oled_set_status("Disconnected");
+
     g_ctx.connected = false;
     g_ctx.kicked = false;
     g_ctx.kick_done_us = 0;
     g_ctx.saw_voltage_notify = false;
     g_ctx.stall_ticks = 0;
+    g_ctx.last_0b4b_us = 0;
+    g_ctx.voltage_recovery_phase = 0;
+    g_ctx.link_probe_sent_us = 0;
+    g_ctx.link_probe_cooldown_until_us = 0;
+    g_ctx.link_probe_kind = BK300_LINK_PROBE_KIND_NONE;
     s_rekick_busy = false;
     g_ctx.rssi_dead_link_streak = 0;
     g_ctx.notify_registered = false;
-    g_ctx.notify_char_handle = 0;
-    g_ctx.notify_cccd_handle = 0;
-    g_ctx.write_char_handle = 0;
-    g_ctx.service_start_handle = 0;
-    g_ctx.service_end_handle = 0;
+    g_ctx.conn_id = 0;
+    g_ctx.notify_pkts = 0;
+    g_ctx.notify_bytes = 0;
+    g_ctx.frames_total = 0;
+    g_ctx.frames_4b0b = 0;
+    g_ctx.frames_badcrc = 0;
+    // peer_bda и handles сохраняем — при переподключении к тому же устройству
+    // можно пропустить service discovery и сэкономить 3+ секунды.
     bk300_rx_reset();
     if (g_ctx.poll_timer) {
       esp_timer_stop(g_ctx.poll_timer);
@@ -612,9 +892,12 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
       g_ctx.poll_timer = NULL;
     }
     oled_set_status("Reconnecting");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_ERROR_CHECK(esp_ble_gap_start_scanning(SCAN_DURATION_S));
+    if (xTaskCreate(bk300_post_disconnect_rescan_task, "bk_rescan", 3584, NULL, 5, NULL) != pdPASS) {
+      ESP_LOGE(TAG, "bk_rescan task create failed — immediate scan");
+      (void)esp_ble_gap_start_scanning(SCAN_DURATION_S);
+    }
     break;
+  }
 
   default:
     ESP_LOGI(TAG, "GATTC unhandled evt=%d", (int)event);
@@ -650,12 +933,17 @@ void bk300_driver_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb
     if (p->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
       uint8_t *adv = p->scan_rst.ble_adv;
       uint8_t adv_len = p->scan_rst.adv_data_len + p->scan_rst.scan_rsp_len;
-      bool match = bk300_advertises_fff0(adv, adv_len) || bk300_name_is_bk300(adv, adv_len);
+      bool match = bk300_name_is_bk300(adv, adv_len);
       if (match) {
-        ESP_LOGI(TAG, "Found BK300 at %02X:%02X:%02X:%02X:%02X:%02X (rssi=%d)",
+        uint8_t nlen = 0;
+        uint8_t *nm = esp_ble_resolve_adv_data(adv, ESP_BLE_AD_TYPE_NAME_CMPL, &nlen);
+        if (!nm) nm = esp_ble_resolve_adv_data(adv, ESP_BLE_AD_TYPE_NAME_SHORT, &nlen);
+        char devname[32] = {0};
+        if (nm && nlen > 0) memcpy(devname, nm, nlen < 31 ? nlen : 31);
+        ESP_LOGI(TAG, "Found BK300 at %02X:%02X:%02X:%02X:%02X:%02X (rssi=%d) name='%s'",
                  p->scan_rst.bda[0], p->scan_rst.bda[1], p->scan_rst.bda[2],
                  p->scan_rst.bda[3], p->scan_rst.bda[4], p->scan_rst.bda[5],
-                 p->scan_rst.rssi);
+                 p->scan_rst.rssi, devname);
         oled_set_rssi_dbm((int16_t)p->scan_rst.rssi);
         oled_set_status("Connecting");
         g_ctx.peer_bda_type = p->scan_rst.ble_addr_type;

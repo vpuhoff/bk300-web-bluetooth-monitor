@@ -449,11 +449,20 @@ void oled_set_status(const char *status) {
 void oled_set_voltage(float volts) {
   if (!s_mutex) return;
   if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
-  if (s_voltage < 0.0f || fabsf(s_voltage - volts) >= 0.005f) {
-    s_voltage = volts;
-    s_dirty = true;
+  if (volts < 0.0f) {
+    /* Offline / сброс: убираем «rx» (voltage_ts_us == 0). */
+    if (s_voltage >= 0.0f || s_voltage_ts_us != 0) {
+      s_voltage = volts;
+      s_dirty = true;
+    }
+    s_voltage_ts_us = 0;
+  } else {
+    if (s_voltage < 0.0f || fabsf(s_voltage - volts) >= 0.005f) {
+      s_voltage = volts;
+      s_dirty = true;
+    }
+    s_voltage_ts_us = esp_timer_get_time();
   }
-  s_voltage_ts_us = esp_timer_get_time();
   xSemaphoreGive(s_mutex);
 }
 
