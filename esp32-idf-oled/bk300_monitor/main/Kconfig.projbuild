@@ -1,0 +1,79 @@
+menu "BK300 OLED options"
+
+    config BK300_OLED_ENABLED
+        bool "Enable SSD1306 OLED display"
+        default y
+        help
+            Подключает встроенный мини-драйвер SSD1306 (через i2c_master) и
+            выводит на экран статус BLE и текущее напряжение. Если экран не
+            подключён физически — драйвер просто не сможет инициализироваться,
+            и проект продолжит работать как обычный bk300_monitor (вывод в
+            UART). Если выключить здесь — i2c вообще не дёргается.
+
+    if BK300_OLED_ENABLED
+
+        config BK300_OLED_I2C_PORT
+            int "I2C port (0 or 1)"
+            default 0
+            range 0 1
+
+        config BK300_OLED_I2C_SDA_GPIO
+            int "I2C SDA GPIO"
+            default 8
+            help
+                По умолчанию 8 — стандарт для ESP32-C3 dev-board. На классическом
+                ESP32 (WROOM/WROVER) обычно 21. На ESP32-S3 dev-kit — тоже часто 8.
+
+        config BK300_OLED_I2C_SCL_GPIO
+            int "I2C SCL GPIO"
+            default 9
+            help
+                По умолчанию 9 (ESP32-C3 dev-board). На классическом ESP32 — 22.
+
+        config BK300_OLED_I2C_FREQ_HZ
+            int "I2C clock (Hz)"
+            default 100000
+            range 100000 1000000
+            help
+                SSD1306 на длинных проводках / слабых подтяжках часто стабильно
+                работает только на 100 kHz. Раньше здесь стоял дефолт 400 kHz —
+                при этом i2c_master_probe() в ESP-IDF проверяет адрес **всегда на
+                100 kHz**, из-за чего probe проходил, а передачи уже на 400 kHz
+                ловили NACK и давали err=259 (ESP_ERR_INVALID_STATE).
+                Если шина короткая и есть внешние 4.7k подтяжки — можно поднять
+                до 400000.
+
+        config BK300_OLED_I2C_ADDR
+            hex "SSD1306 I2C address (7-bit)"
+            default 0x3C
+            help
+                Большинство китайских модулей — 0x3C. Изредка попадаются с
+                перепаянной перемычкой адреса — 0x3D.
+
+        config BK300_OLED_TRY_ALT_ADDR
+            bool "If init fails, retry alternate I2C address (0x3C <-> 0x3D)"
+            default y
+            help
+                Часть модулей с ADDR-перемычкой отвечают на другой адрес. Включено
+                по умолчанию: после неудачной инициализации пробуем второй адрес.
+
+        config BK300_OLED_ROTATE_180
+            bool "Rotate display 180 degrees"
+            default y
+            help
+                Если экран физически смонтирован «вверх ногами», поверни.
+
+    endif
+
+endmenu
+
+menu "BK300 logging"
+
+    config BK300_BT_VERBOSE_LOGS
+        bool "Verbose BT_HCI / BT_GATT logs on UART (debug)"
+        default n
+        help
+            Включает esp_log_level_set(BT_HCI/BT_GATT, DEBUG) — очень шумно.
+            Для «боевого» монитора с OLED обычно достаточно WARNING/INFO.
+
+endmenu

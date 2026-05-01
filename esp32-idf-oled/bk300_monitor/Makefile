@@ -1,4 +1,4 @@
-# Makefile-обёртка над ESP-IDF для проекта bk300_monitor.
+# Makefile-обёртка над ESP-IDF для проекта bk300_oled_monitor (OLED-вариант).
 # Цель — на чистой Ubuntu из-под одной команды получить рабочее окружение и собрать прошивку.
 #
 # Быстрый старт:
@@ -28,7 +28,7 @@ IDF_PATH     ?= $(HOME)/esp/esp-idf
 IDF_TOOLS_PATH ?= $(HOME)/.espressif
 
 # ---- Параметры пакета (для `make package`) ----
-PROJECT_NAME ?= bk300_monitor
+PROJECT_NAME ?= bk300_oled_monitor
 PKG_VERSION  ?= $(shell git -C $(CURDIR) describe --tags --always --dirty 2>/dev/null || date +%Y%m%d-%H%M%S)
 # Тоже lazy (`=`), чтобы $(TARGET) и $(PKG_VERSION) перевычислялись в момент package,
 # а не парсинга — иначе CHIP=esp32s3 «прилипает» к flash.env даже после смены target.
@@ -53,7 +53,7 @@ APT_PKGS     := git wget flex bison gperf python3 python3-pip python3-venv \
 # ---- Help ----
 .PHONY: help
 help:
-	@echo "ESP-IDF make-обёртка для bk300_monitor."
+	@echo "ESP-IDF make-обёртка для bk300_oled_monitor (OLED-вариант)."
 	@echo ""
 	@echo "Параметры (export или make VAR=value):"
 	@echo "  TARGET=$(TARGET)              # esp32 / esp32s3 / esp32c3 / esp32c6 / esp32h2"
