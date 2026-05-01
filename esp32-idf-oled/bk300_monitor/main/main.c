@@ -14,6 +14,7 @@
  * специфичном для радио ESP32 vs прошивка BK300. Тогда нужен сниффер на nRF52840.
  */
 #include <inttypes.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 
@@ -243,8 +244,10 @@ static void bk300_send_kick_sequence(void) {
 }
 
 static void bk300_poll_timer_cb(void *arg) {
+  (void)arg;
   if (!g_ctx.connected) return;
   bk300_send_0b0b("0B0B periodic");
+  (void)esp_ble_gap_read_rssi(g_ctx.peer_bda);
 }
 
 // ---- Frames draining ----
@@ -282,6 +285,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
     g_ctx.registered = (p->reg.status == ESP_GATT_OK);
     g_ctx.gattc_if = gattc_if;
     if (g_ctx.registered) {
+      oled_set_rssi_dbm(OLED_RSSI_NONE);
       oled_set_status("Scanning...");
       ESP_ERROR_CHECK(esp_ble_gap_set_scan_params(&s_scan_params));
     }
@@ -318,6 +322,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
   case ESP_GATTC_OPEN_EVT:
     if (p->open.status != ESP_GATT_OK) {
       ESP_LOGE(TAG, "GATTC open fail, status=%d", p->open.status);
+      oled_set_rssi_dbm(OLED_RSSI_NONE);
       oled_set_status("Conn failed");
       g_ctx.connected = false;
       // restart scan after small backoff
@@ -474,6 +479,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
 
   case ESP_GATTC_DISCONNECT_EVT:
     ESP_LOGW(TAG, "Disconnected, reason=0x%02X", p->disconnect.reason);
+    oled_set_rssi_dbm(OLED_RSSI_NONE);
     oled_set_status("Disconnected");
     g_ctx.connected = false;
     g_ctx.kicked = false;
@@ -534,6 +540,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                  p->scan_rst.bda[0], p->scan_rst.bda[1], p->scan_rst.bda[2],
                  p->scan_rst.bda[3], p->scan_rst.bda[4], p->scan_rst.bda[5],
                  p->scan_rst.rssi);
+        oled_set_rssi_dbm((int16_t)p->scan_rst.rssi);
         oled_set_status("Connecting");
         g_ctx.peer_bda_type = p->scan_rst.ble_addr_type;
         memcpy(g_ctx.peer_bda, p->scan_rst.bda, sizeof(esp_bd_addr_t));
@@ -542,6 +549,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
       }
     } else if (p->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_CMPL_EVT) {
       ESP_LOGI(TAG, "scan finished, no BK300 — restarting");
+      oled_set_rssi_dbm(OLED_RSSI_NONE);
       oled_set_status("Not found");
       ESP_ERROR_CHECK(esp_ble_gap_start_scanning(SCAN_DURATION_S));
     }
@@ -564,6 +572,16 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
   case ESP_GAP_BLE_PHY_UPDATE_COMPLETE_EVT:
     ESP_LOGI(TAG, "PHY updated: tx=%d rx=%d status=%d",
              p->phy_update.tx_phy, p->phy_update.rx_phy, p->phy_update.status);
+    break;
+
+  case ESP_GAP_BLE_READ_RSSI_COMPLETE_EVT:
+    if (p->read_rssi_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+      int8_t r = p->read_rssi_cmpl.rssi;
+      // По даташиту Bluedroid 127 = «не удалось прочитать».
+      if (r != 127) {
+        oled_set_rssi_dbm((int16_t)r);
+      }
+    }
     break;
 
 #if defined(CONFIG_BT_BLE_SMP_ENABLE) && CONFIG_BT_BLE_SMP_ENABLE

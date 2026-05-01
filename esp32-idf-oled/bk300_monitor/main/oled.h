@@ -15,7 +15,11 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
+
+/** Нет измерения RSSI (оффлайн / до скана) — в углу «--%». */
+#define OLED_RSSI_NONE ((int16_t)INT16_MIN)
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +37,9 @@ void oled_set_status(const char *status);
 // Установить отображаемое напряжение в вольтах. Передавай отрицательное
 // значение (например -1.0f), чтобы показать «--.-- V».
 void oled_set_voltage(float volts);
+
+// Уровень сигнала BLE в dBm (типично −100…−40). Значение OLED_RSSI_NONE — не показывать число.
+void oled_set_rssi_dbm(int16_t rssi_dbm);
 
 // Принудительно «пнуть» рендер — обычно не нужен, render-task сам
 // перерисовывает раз в секунду + при каждом изменении статуса/вольтажа.

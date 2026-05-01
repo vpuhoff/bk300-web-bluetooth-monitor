@@ -31,6 +31,7 @@
 esp_err_t oled_init(void) { return ESP_OK; }
 void oled_set_status(const char *s) { (void)s; }
 void oled_set_voltage(float v) { (void)v; }
+void oled_set_rssi_dbm(int16_t rssi) { (void)rssi; }
 void oled_kick(void) {}
 
 #else
@@ -56,7 +57,18 @@ static SemaphoreHandle_t            s_mutex = NULL;
 static char                         s_status[40] = "Booting...";
 static float                        s_voltage = -1.0f;
 static int64_t                      s_voltage_ts_us = 0;
+static int16_t                      s_rssi_dbm = INT16_MIN;
 static bool                         s_dirty = true;
+
+// RSSI плохой/хороший для линейной шкалы 0…100%.
+#define OLED_LINK_RSSI_MIN  (-100)
+#define OLED_LINK_RSSI_MAX  (-50)
+
+static int rssi_dbm_to_percent(int16_t dbm) {
+  if (dbm < OLED_LINK_RSSI_MIN) return 0;
+  if (dbm > OLED_LINK_RSSI_MAX) return 100;
+  return (int)(dbm - OLED_LINK_RSSI_MIN) * 100 / (OLED_LINK_RSSI_MAX - OLED_LINK_RSSI_MIN);
+}
 
 // ============================================================
 // ===        LCD install / teardown (per addr+freq try)    ===
@@ -232,13 +244,23 @@ static void ui_format_uptime(char *out, size_t cap, uint32_t up_s) {
   }
 }
 
-static void ui_render(const char *status, float voltage, int64_t voltage_ts_us) {
+static void ui_render(const char *status, float voltage, int64_t voltage_ts_us,
+                      int16_t rssi_dbm) {
   fb_clear();
 
   fb_draw_string(0, 0, "BK300: ", 1);
   if (status && status[0]) {
     fb_draw_string(7 * OLED_FONT_ADVANCE_W, 0, status, 1);
   }
+
+  char rssi_buf[8];
+  if (rssi_dbm == INT16_MIN) {
+    snprintf(rssi_buf, sizeof(rssi_buf), "--%%");
+  } else {
+    snprintf(rssi_buf, sizeof(rssi_buf), "%d%%", rssi_dbm_to_percent(rssi_dbm));
+  }
+  int rssi_w = text_width(rssi_buf, 1);
+  fb_draw_string(SSD1306_W - rssi_w, 0, rssi_buf, 1);
 
   fb_hline(0, SSD1306_W - 1, 11, true);
 
@@ -292,6 +314,7 @@ static void oled_task(void *arg) {
     char       status_local[sizeof(s_status)];
     float      voltage_local;
     int64_t    voltage_ts_local;
+    int16_t    rssi_local;
 
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) != pdTRUE) continue;
     dirty_local = s_dirty;
@@ -300,13 +323,14 @@ static void oled_task(void *arg) {
     status_local[sizeof(status_local) - 1] = 0;
     voltage_local = s_voltage;
     voltage_ts_local = s_voltage_ts_us;
+    rssi_local = s_rssi_dbm;
     xSemaphoreGive(s_mutex);
 
     bool force = (now_ms - last_render_ms) >= FORCE_REFRESH_MS;
     bool can_dirty = (now_ms - last_render_ms) >= MIN_REFRESH_MS;
     if (!(force || (dirty_local && can_dirty))) continue;
 
-    ui_render(status_local, voltage_local, voltage_ts_local);
+    ui_render(status_local, voltage_local, voltage_ts_local, rssi_local);
     esp_err_t e = ssd1306_flush_fb();
     if (e != ESP_OK) {
       ESP_LOGW(TAG, "flush err=%d %s", e, esp_err_to_name(e));
@@ -430,6 +454,16 @@ void oled_set_voltage(float volts) {
     s_dirty = true;
   }
   s_voltage_ts_us = esp_timer_get_time();
+  xSemaphoreGive(s_mutex);
+}
+
+void oled_set_rssi_dbm(int16_t rssi_dbm) {
+  if (!s_mutex) return;
+  if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  if (s_rssi_dbm != rssi_dbm) {
+    s_rssi_dbm = rssi_dbm;
+    s_dirty = true;
+  }
   xSemaphoreGive(s_mutex);
 }
 
