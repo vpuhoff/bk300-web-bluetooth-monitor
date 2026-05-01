@@ -5,6 +5,7 @@
 idf_component_register(
     SRCS
         "main.c"
+        "bk300_driver.c"
         "bk300_protocol.c"
         "oled.c"
     INCLUDE_DIRS "."
