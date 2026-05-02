@@ -1041,3 +1041,27 @@ static void stats_task(void *arg) {
 void bk300_driver_start_stats_task(void) {
   xTaskCreate(stats_task, "bk300_stats", 4096, NULL, 5, NULL);
 }
+
+void bk300_driver_stop(void) {
+  ESP_LOGI(TAG, "bk300_driver_stop: disconnecting and stopping scan");
+  if (g_ctx.connected) {
+    esp_ble_gattc_close(g_ctx.gattc_if, g_ctx.conn_id);
+    vTaskDelay(pdMS_TO_TICKS(300));
+  } else {
+    esp_ble_gap_stop_scanning();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  if (g_ctx.poll_timer) {
+    esp_timer_stop(g_ctx.poll_timer);
+    esp_timer_delete(g_ctx.poll_timer);
+    g_ctx.poll_timer = NULL;
+  }
+}
+
+void bk300_driver_restart(void) {
+  ESP_LOGI(TAG, "bk300_driver_restart: reset context and start scan");
+  memset(&g_ctx, 0, sizeof(g_ctx));
+  g_ctx.gattc_if = ESP_GATT_IF_NONE;
+  bk300_rx_reset();
+  ESP_ERROR_CHECK(esp_ble_gap_start_scanning(SCAN_DURATION_S));
+}

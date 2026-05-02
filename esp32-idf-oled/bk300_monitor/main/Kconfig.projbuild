@@ -67,6 +67,54 @@ menu "BK300 OLED options"
 
 endmenu
 
+menu "BK300 WiFi / NTP sync"
+
+    config BK300_WIFI_SSID
+        string "WiFi SSID"
+        default "DarkNet 2G"
+        help
+            Имя сети WiFi для синхронизации времени через NTP.
+            WiFi включается только на время синхронизации (двойное нажатие BOOT),
+            потом отключается и запускается BLE.
+
+    config BK300_WIFI_PASS
+        string "WiFi password"
+        default ""
+        help
+            Пароль WiFi. Хранится в sdkconfig (не в исходном коде).
+            Добавь sdkconfig и sdkconfig.defaults в .gitignore если это
+            публичный репозиторий.
+
+    config BK300_NTP_SERVER
+        string "NTP server"
+        default "pool.ntp.org"
+        help
+            NTP-сервер для синхронизации времени.
+
+    config BK300_NTP_TIMEOUT_S
+        int "NTP sync timeout (seconds)"
+        default 15
+        range 5 60
+        help
+            Максимальное время ожидания NTP-ответа. Если за это время
+            время не синхронизировано — продолжаем без NTP.
+
+    config BK300_BOOT_BUTTON_GPIO
+        int "BOOT button GPIO"
+        default 0
+        help
+            GPIO кнопки BOOT. На большинстве ESP32 dev-board это GPIO0.
+            Двойное нажатие (два нажатия за 2 секунды) запускает NTP-синхронизацию.
+
+    config BK300_BOOT_DOUBLE_PRESS_MS
+        int "Double press window (ms)"
+        default 2000
+        range 500 5000
+        help
+            Временное окно для двойного нажатия BOOT в миллисекундах.
+
+endmenu
+
 menu "BK300 logging"
 
     config BK300_BT_VERBOSE_LOGS

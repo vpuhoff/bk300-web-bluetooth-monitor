@@ -18,3 +18,9 @@ void bk300_driver_gattc_event_handler(esp_gattc_cb_event_t event,
 
 /** Периодический лог статистики уведомлений (FreeRTOS task). */
 void bk300_driver_start_stats_task(void);
+
+/** Остановить BLE-активность (disconnect/stop scan) перед WiFi. Блокирует до ~400ms. */
+void bk300_driver_stop(void);
+
+/** Сбросить контекст и запустить сканирование заново (после WiFi+NTP). */
+void bk300_driver_restart(void);

@@ -8,6 +8,7 @@ idf_component_register(
         "bk300_driver.c"
         "bk300_protocol.c"
         "oled.c"
+        "ntp_sync.c"
     INCLUDE_DIRS "."
     REQUIRES
         bt
@@ -16,4 +17,8 @@ idf_component_register(
         esp_driver_i2c
         esp_lcd
         esp_timer
+        esp_wifi
+        esp_netif
+        esp_event
+        lwip
 )
